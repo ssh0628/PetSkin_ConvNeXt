@@ -17,6 +17,54 @@ from sklearn.metrics import classification_report, precision_recall_fscore_suppo
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 
+def find_json_for_image(img_path: Path) -> Path | None:
+    c1 = img_path.with_suffix(".json")
+    if c1.exists():
+        return c1
+    c2 = img_path.with_suffix(".JSON")
+    if c2.exists():
+        return c2
+    c3 = img_path.with_name(img_path.name + ".json")
+    if c3.exists():
+        return c3
+    c4 = img_path.with_name(img_path.name + ".JSON")
+    if c4.exists():
+        return c4
+    return None
+
+
+def extract_roi_box(json_path: Path | None, img_w: int, img_h: int):
+    if not json_path or not json_path.exists():
+        return None
+    try:
+        data = json.loads(json_path.read_text(encoding="utf-8"))
+        if "labelingInfo" not in data:
+            return None
+        for info_item in data["labelingInfo"]:
+            box_info = info_item.get("box")
+            if not box_info:
+                continue
+            locations = box_info.get("location") or []
+            if not locations:
+                continue
+            loc = locations[0]
+            x = int(loc.get("x"))
+            y = int(loc.get("y"))
+            w = int(loc.get("width"))
+            h = int(loc.get("height"))
+            if w <= 0 or h <= 0:
+                continue
+            x1 = max(0, x)
+            y1 = max(0, y)
+            x2 = min(img_w, x + w)
+            y2 = min(img_h, y + h)
+            if x2 > x1 and y2 > y1:
+                return (x1, y1, x2, y2)
+    except Exception:
+        return None
+    return None
+
+
 class NPYPathDataset(Dataset):
     def __init__(self, npy_dir: Path, split: str, transform=None, fallback_size: int = 224):
         self.npy_dir = Path(npy_dir)
@@ -44,7 +92,11 @@ class NPYPathDataset(Dataset):
         y = int(self.labels[idx])
 
         try:
-            img = Image.open(path).convert("RGB")
+            with Image.open(path) as raw_img:
+                img = raw_img.convert("RGB")
+            roi_box = extract_roi_box(find_json_for_image(Path(path)), img.width, img.height)
+            if roi_box is not None:
+                img = img.crop(roi_box)
         except Exception:
             # 깨진 이미지면 검은 이미지로 대체 (원하면 raise로 바꿔도 됨)
             img = Image.new("RGB", (self.fallback_size, self.fallback_size))
