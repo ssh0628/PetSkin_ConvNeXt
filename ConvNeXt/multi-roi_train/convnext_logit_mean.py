@@ -1,3 +1,4 @@
+# multi-roi_train/convnext_logit_mean.py
 import os
 import sys
 import csv
