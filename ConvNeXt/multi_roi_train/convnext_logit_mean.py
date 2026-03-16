@@ -20,7 +20,6 @@ from pathlib import Path
 # ROI view config (constants)
 # -------------------------
 DROP_MIN_SIDE = 20
-SMALL_ROI_MIN_SIDE = 80
 N_SCALE = 2.0
 K_OFFSET = 0.1
 USE_OFF_VIEW = True
@@ -103,6 +102,21 @@ def square_crop_clamp(img: Image.Image, cx: float, cy: float, window_size: int):
     return img.crop((x1, y1, x2, y2))
 
 
+def clamp_center_for_bbox(off_c: float, box_lo: int, box_hi: int, crop_size: int, img_size: int):
+    half = crop_size / 2.0
+    lo_img = half
+    hi_img = img_size - half
+    lo_box = box_hi - half
+    hi_box = box_lo + half
+    lo = max(lo_img, lo_box)
+    hi = min(hi_img, hi_box)
+    if lo <= hi:
+        return max(lo, min(off_c, hi))
+    if lo_img <= hi_img:
+        return max(lo_img, min(off_c, hi_img))
+    return off_c
+
+
 def crop_views(img: Image.Image, roi_box, img_size: int):
     img_w, img_h = img.size
     if roi_box is None:
@@ -120,19 +134,16 @@ def crop_views(img: Image.Image, roi_box, img_size: int):
     cy = y1 + h0 / 2
 
     # ROI view: tight crop to ROI box
-    if min_side < SMALL_ROI_MIN_SIDE:
-        # still keep tight ROI; ext/off will add context
-        roi_crop = img.crop((x1, y1, x2, y2))
-    else:
-        roi_crop = img.crop((x1, y1, x2, y2))
-    roi_crop = roi_crop.resize((img_size, img_size), resample=Image.BICUBIC)
+    roi_crop = img.crop((x1, y1, x2, y2)).resize((img_size, img_size), resample=Image.BICUBIC)
 
     scale = max(img_size, int(round(N_SCALE * max(w0, h0))))
     ext_crop = square_crop_clamp(img, cx, cy, scale).resize((img_size, img_size), resample=Image.BICUBIC)
 
     dx = random.uniform(-K_OFFSET * scale, K_OFFSET * scale)
     dy = random.uniform(-K_OFFSET * scale, K_OFFSET * scale)
-    off_crop = square_crop_clamp(img, cx + dx, cy + dy, scale).resize((img_size, img_size), resample=Image.BICUBIC)
+    off_cx = clamp_center_for_bbox(cx + dx, x1, x2, scale, img_w)
+    off_cy = clamp_center_for_bbox(cy + dy, y1, y2, scale, img_h)
+    off_crop = square_crop_clamp(img, off_cx, off_cy, scale).resize((img_size, img_size), resample=Image.BICUBIC)
     return roi_crop, ext_crop, off_crop
 # =========================
 # 0. PIL / CUDA / AMP 설정

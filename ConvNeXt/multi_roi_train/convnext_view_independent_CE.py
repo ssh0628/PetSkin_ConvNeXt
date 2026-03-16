@@ -1,4 +1,4 @@
-# multi-roi_train/convnext_view_independent_WCE.py
+# multi-roi_train/convnext_view_independent_CE.py
 import os
 import sys
 import csv
@@ -7,7 +7,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 from timm import create_model
@@ -21,8 +20,7 @@ from pathlib import Path
 # ROI view config (constants)
 # -------------------------
 DROP_MIN_SIDE = 20
-SMALL_ROI_MIN_SIDE = 80
-N_SCALE = 2.0
+N_SCALE = 1.2
 K_OFFSET = 0.1
 USE_OFF_VIEW = True
 NUM_VIEWS = 3  # roi, extended, offset (when USE_OFF_VIEW)
@@ -105,6 +103,21 @@ def square_crop_clamp(img: Image.Image, cx: float, cy: float, window_size: int):
     return img.crop((x1, y1, x2, y2))
 
 
+def clamp_center_for_bbox(off_c: float, box_lo: int, box_hi: int, crop_size: int, img_size: int):
+    half = crop_size / 2.0
+    lo_img = half
+    hi_img = img_size - half
+    lo_box = box_hi - half
+    hi_box = box_lo + half
+    lo = max(lo_img, lo_box)
+    hi = min(hi_img, hi_box)
+    if lo <= hi:
+        return max(lo, min(off_c, hi))
+    if lo_img <= hi_img:
+        return max(lo_img, min(off_c, hi_img))
+    return off_c
+
+
 def crop_view(img: Image.Image, roi_box, view_type: int, img_size: int):
     img_w, img_h = img.size
     if roi_box is None:
@@ -120,10 +133,6 @@ def crop_view(img: Image.Image, roi_box, view_type: int, img_size: int):
     cx = x1 + w0 / 2
     cy = y1 + h0 / 2
 
-    # Small ROI: use scale-based extended window instead of tight ROI.
-    if min_side < SMALL_ROI_MIN_SIDE:
-        view_type = 1  # treat as extended
-
     if view_type == 0:
         crop = img.crop((x1, y1, x2, y2))
         return crop.resize((img_size, img_size), resample=Image.BICUBIC)
@@ -133,8 +142,8 @@ def crop_view(img: Image.Image, roi_box, view_type: int, img_size: int):
     if view_type == 2:
         dx = random.uniform(-K_OFFSET * scale, K_OFFSET * scale)
         dy = random.uniform(-K_OFFSET * scale, K_OFFSET * scale)
-        cx += dx
-        cy += dy
+        cx = clamp_center_for_bbox(cx + dx, x1, x2, scale, img_w)
+        cy = clamp_center_for_bbox(cy + dy, y1, y2, scale, img_h)
 
     crop = square_crop_clamp(img, cx, cy, scale)
     return crop.resize((img_size, img_size), resample=Image.BICUBIC)
@@ -161,7 +170,7 @@ print(f"AMP Config: device={amp_device}, dtype={amp_dtype}")
 # 1. 설정
 # =========================
 NPY_DIR = "/root/project/dataset/cache_npy_sqrt"
-SAVE_DIR = "/root/project/convnext/convnext_sqrt_roi_1_WCE"
+SAVE_DIR = "/root/project/Result/multi_roi_trained/3view(independent)+CE_ver3"
 os.makedirs(SAVE_DIR, exist_ok=True)
 LOG_PATH = os.path.join(SAVE_DIR, "train_log.csv")
 
@@ -177,11 +186,9 @@ PREFETCH_FACTOR = 2
 PERSISTENT_WORKERS = True
 USE_CHANNELS_LAST = True
 USE_COMPILE = False
-
-LOSS_MODE = "wce"  # "ce", "wce", "focal"
-FOCAL_GAMMA = 2.0
-FOCAL_USE_ALPHA = True
-FOCAL_ALPHA_MODE = "inv_sqrt"  # "inv", "inv_sqrt"
+LOSS_MODE = "CE"  # "CE" or "WCE"
+WCE_MODE = "inv_sqrt"  # "inv" or "inv_sqrt"
+WCE_NORMALIZE = True
 
 import random
 random.seed(RANDOM_SEED)
@@ -199,6 +206,17 @@ model_name = "convnextv2_tiny.fcmae_ft_in22k_in1k"
 drop_path_rate = 0.2
 
 print(f"[Info] Reading Data from: {NPY_DIR}")
+
+def compute_wce_weights(labels: np.ndarray, num_classes: int):
+    counts = np.bincount(labels, minlength=num_classes).astype(np.float64)
+    counts[counts == 0] = 1.0
+    if WCE_MODE == "inv":
+        weights = 1.0 / counts
+    else:
+        weights = 1.0 / np.sqrt(counts)
+    if WCE_NORMALIZE:
+        weights = weights / weights.mean()
+    return torch.tensor(weights, dtype=torch.float32)
 
 # -------------------------
 # ROI (JSON -> bbox)
@@ -245,35 +263,6 @@ def extract_roi_box(json_path: Path, img_w: int, img_h: int):
     except Exception:
         return None
     return None
-
-
-def build_class_weights(labels, num_classes, mode="inv_sqrt"):
-    counts = np.bincount(np.asarray(labels, dtype=np.int64), minlength=num_classes).astype(np.float32)
-    counts[counts <= 0] = 1.0
-    if mode == "inv":
-        weights = 1.0 / counts
-    else:
-        weights = 1.0 / np.sqrt(counts)
-    weights = weights / weights.mean()
-    return torch.tensor(weights, dtype=torch.float32)
-
-
-class FocalLoss(nn.Module):
-    def __init__(self, gamma=2.0, alpha=None):
-        super().__init__()
-        self.gamma = float(gamma)
-        if alpha is not None and not isinstance(alpha, torch.Tensor):
-            alpha = torch.tensor(alpha, dtype=torch.float32)
-        self.register_buffer("alpha", alpha if alpha is not None else None)
-
-    def forward(self, logits, targets):
-        ce = F.cross_entropy(logits, targets, reduction="none")
-        pt = torch.exp(-ce)
-        loss = (1.0 - pt) ** self.gamma * ce
-        if self.alpha is not None:
-            alpha_t = self.alpha.gather(0, targets)
-            loss = alpha_t * loss
-        return loss.mean()
     
 # =========================
 # 1.1 Class Check
@@ -442,19 +431,18 @@ test_loader = DataLoader(
 # =========================
 # 6. Optimizer / Scheduler
 # =========================
-class_weights = build_class_weights(train_dataset.labels, NUM_CLASSES, mode=FOCAL_ALPHA_MODE).to(device)
-print(f"[Info] LOSS_MODE={LOSS_MODE}, class_weights={class_weights.detach().cpu().tolist()}")
-
-if LOSS_MODE == "ce":
-    criterion = nn.CrossEntropyLoss()
-elif LOSS_MODE == "wce":
-    criterion = nn.CrossEntropyLoss(weight=class_weights)
-elif LOSS_MODE == "focal":
-    focal_alpha = class_weights if FOCAL_USE_ALPHA else None
-    criterion = FocalLoss(gamma=FOCAL_GAMMA, alpha=focal_alpha)
+if LOSS_MODE == "WCE":
+    train_labels_path = Path(NPY_DIR) / "train_labels.npy"
+    if train_labels_path.exists():
+        train_labels = np.load(train_labels_path, allow_pickle=True).astype(np.int64)
+        wce_weights = compute_wce_weights(train_labels, NUM_CLASSES)
+        print(f"[Info] WCE enabled ({WCE_MODE}).")
+    else:
+        print(f"[WARN] train_labels.npy not found for WCE: {train_labels_path}")
+        wce_weights = None
+    criterion = nn.CrossEntropyLoss(weight=wce_weights.to(device) if wce_weights is not None else None)
 else:
-    raise ValueError(f"Unsupported LOSS_MODE: {LOSS_MODE}")
-
+    criterion = nn.CrossEntropyLoss()
 optimizer = optim.AdamW(
     filter(lambda p: p.requires_grad, model.parameters()),
     lr=LR1,

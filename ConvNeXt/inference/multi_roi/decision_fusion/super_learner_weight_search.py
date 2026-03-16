@@ -117,6 +117,21 @@ def deterministic_hash_offset(path: str, base_w: float, base_h: float, k_offset:
     return rx * max_shift_x, ry * max_shift_y
 
 
+def clamp_center_for_bbox(off_c: float, box_lo: int, box_hi: int, crop_size: int, img_size: int):
+    half = crop_size / 2.0
+    lo_img = half
+    hi_img = img_size - half
+    lo_box = box_hi - half
+    hi_box = box_lo + half
+    lo = max(lo_img, lo_box)
+    hi = min(hi_img, hi_box)
+    if lo <= hi:
+        return max(lo, min(off_c, hi))
+    if lo_img <= hi_img:
+        return max(lo_img, min(off_c, hi_img))
+    return off_c
+
+
 def crop_three_views(
     img: Image.Image,
     path: str,
@@ -163,7 +178,11 @@ def crop_three_views(
     else:
         dx = k_offset * w_ext
         dy = k_offset * h_ext
-    off_crop = rect_crop_clamp(img, cx + dx, cy + dy, w_ext, h_ext).resize((imgsz, imgsz), resample=Image.BICUBIC)
+
+    # Shift only within feasible range so lesion bbox stays in view.
+    off_cx = clamp_center_for_bbox(cx + dx, x1, x2, w_ext, img.width)
+    off_cy = clamp_center_for_bbox(cy + dy, y1, y2, h_ext, img.height)
+    off_crop = rect_crop_clamp(img, off_cx, off_cy, w_ext, h_ext).resize((imgsz, imgsz), resample=Image.BICUBIC)
 
     return roi_crop, ext_crop, off_crop
 
@@ -359,8 +378,8 @@ def evaluate_and_save(z: np.ndarray, y_true: np.ndarray, classes, out_dir: Path,
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ckpt", default="/root/project/convnext/convnext_relabeled_tiny/best_model.pth", type=str)
-    ap.add_argument("--npy_dir", default="/root/project/dataset/cache_npy", type=str)
+    ap.add_argument("--ckpt", default="/root/project/Result/multi_roi_trained/3view(independent)+CE/best_model.pth", type=str)
+    ap.add_argument("--npy_dir", default="/root/project/dataset/cache_npy_sqrt", type=str)
     ap.add_argument("--split", default="val", choices=["val", "test"])
     ap.add_argument("--model_name", default="convnextv2_tiny.fcmae_ft_in22k_in1k", type=str)
     ap.add_argument("--drop_path", default=0.1, type=float)
@@ -368,24 +387,24 @@ def main():
     ap.add_argument("--batch", default=256, type=int)
     ap.add_argument("--workers", default=8, type=int)
     ap.add_argument("--device", default="cuda:0", type=str)
-    ap.add_argument("--out_dir", default="/root/project/convnext/convnext_relabeled_tiny_super_learner", type=str)
+    ap.add_argument("--out_dir", default="/root/project/Result/multi_roi_inference/decision_fusion/super_learner/3view+CE", type=str)
 
     ap.add_argument("--n_views", default=3, choices=[1, 3], type=int)
-    ap.add_argument("--fusion", default="logit_mean", choices=["logit_mean", "prob_mean", "weighted"])
-    ap.add_argument("--offset_mode", default="fixed", choices=["fixed", "hash"])
+    ap.add_argument("--fusion", default="weighted", choices=["logit_mean", "prob_mean", "weighted"])
+    ap.add_argument("--offset_mode", default="hash", choices=["fixed", "hash"])
     ap.add_argument("--drop_min_side", default=20, type=int)
-    ap.add_argument("--ext_ratio", default=2.0, type=float)
+    ap.add_argument("--ext_ratio", default=1.2, type=float)
     ap.add_argument("--min_ext_crop", default=80, type=int)
     ap.add_argument("--k_offset", default=0.1, type=float)
     ap.add_argument("--fallback", default="black", choices=["black", "full"])
 
-    ap.add_argument("--search_weights", action="store_true")
+    ap.add_argument("--search_weights", default="search")
     ap.add_argument("--grid_step", default=0.01, type=float)
     ap.add_argument("--metric", default="macro_f1", choices=["acc", "macro_f1"])
     ap.add_argument("--cache_logits", action="store_true")
-    ap.add_argument("--save_logits_path", default="", type=str)
+    ap.add_argument("--save_logits_path", default="/root/project/Result/multi_roi_inference/decision_fusion/super_learner/3view+CE", type=str)
     ap.add_argument("--load_logits_path", default="", type=str)
-    ap.add_argument("--save_weights", default="", type=str)
+    ap.add_argument("--save_weights", default="/root/project/Result/multi_roi_inference/decision_fusion/super_learner/3view+CE/weights.json", type=str)
     ap.add_argument("--use_weights", default="", type=str)
 
     args = ap.parse_args()
