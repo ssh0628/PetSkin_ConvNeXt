@@ -34,12 +34,9 @@ def build_parser(default_out_dir: str):
 
     ap.add_argument("--n_views", default=3, choices=[1, 3], type=int)
     ap.add_argument("--drop_min_side", default=20, type=int)
-    ap.add_argument("--ext_ratio", default=2.0, type=float)
-    ap.add_argument("--min_ext_crop", default=80, type=int)
+    ap.add_argument("--ext_ratio", default=1.2, type=float)
     ap.add_argument("--k_offset", default=0.1, type=float)
-    ap.add_argument("--offset_mode", default="fixed", choices=["fixed", "hash"])
-    ap.add_argument("--fallback", default="black", choices=["black", "full"])
-
+    ap.add_argument("--offset_mode", default="hash", choices=["fixed", "hash"])
     ap.add_argument("--probability_threshold", "--probablity_threshold", dest="probability_threshold", default=0.8, type=float)
     ap.add_argument("--gap_threshold", default=0.2, type=float)
     return ap
@@ -99,10 +96,8 @@ def run_rule_fusion(args, rule_name: str, selector: Callable):
         imgsz=args.imgsz,
         drop_min_side=args.drop_min_side,
         ext_ratio=args.ext_ratio,
-        min_ext_crop=args.min_ext_crop,
         k_offset=args.k_offset,
         offset_mode=args.offset_mode,
-        fallback=args.fallback,
     )
     loader = DataLoader(
         ds,

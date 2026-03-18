@@ -1,7 +1,7 @@
 import os
 import csv
 import json
-import random
+import hashlib
 from pathlib import Path
 
 import numpy as np
@@ -161,10 +161,19 @@ def clamp_center_for_bbox(off_c: float, box_lo: int, box_hi: int, crop_size: int
     return off_c
 
 
-def crop_view(img: Image.Image, roi_box, view_type: int, img_size: int):
+def deterministic_hash_offset(path: str, base_size: float, k_offset: float):
+    digest = hashlib.md5(path.encode("utf-8")).digest()
+    a = int.from_bytes(digest[:8], "big")
+    b = int.from_bytes(digest[8:], "big")
+    rx = (a / ((1 << 64) - 1)) * 2.0 - 1.0
+    ry = (b / ((1 << 64) - 1)) * 2.0 - 1.0
+    return rx * k_offset * base_size, ry * k_offset * base_size
+
+
+def crop_view(img: Image.Image, path: str, roi_box, view_type: int, img_size: int):
     img_w, img_h = img.size
     if roi_box is None:
-        return img.resize((img_size, img_size), resample=Image.BICUBIC)
+        return None
 
     x1, y1, x2, y2 = roi_box
     w0 = x2 - x1
@@ -180,10 +189,9 @@ def crop_view(img: Image.Image, roi_box, view_type: int, img_size: int):
         crop = img.crop((x1, y1, x2, y2))
         return crop.resize((img_size, img_size), resample=Image.BICUBIC)
 
-    scale = max(img_size, int(round(N_SCALE * max(w0, h0))))
+    scale = max(1, int(round(N_SCALE * max(w0, h0))))
     if view_type == 2:
-        dx = random.uniform(-K_OFFSET * scale, K_OFFSET * scale)
-        dy = random.uniform(-K_OFFSET * scale, K_OFFSET * scale)
+        dx, dy = deterministic_hash_offset(path, scale, K_OFFSET)
         cx = clamp_center_for_bbox(cx + dx, x1, x2, scale, img_w)
         cy = clamp_center_for_bbox(cy + dy, y1, y2, scale, img_h)
 
@@ -226,8 +234,30 @@ class A4MixedViewDataset(Dataset):
         if not paths_file.exists() or not labels_file.exists():
             raise RuntimeError(f"[ERR] Missing NPY files for split '{split}' in {npy_dir}")
 
-        self.paths = np.load(paths_file, allow_pickle=True)
-        self.labels = np.load(labels_file, allow_pickle=True).astype(np.int64)
+        raw_paths = np.load(paths_file, allow_pickle=True)
+        raw_labels = np.load(labels_file, allow_pickle=True).astype(np.int64)
+        valid_paths = []
+        valid_labels = []
+        dropped = 0
+        for p, y in zip(raw_paths, raw_labels):
+            path = str(p)
+            try:
+                with Image.open(path) as img:
+                    img = img.convert("RGB")
+                    roi_box = extract_roi_box(find_json_for_image(Path(path)), img.width, img.height)
+                if roi_box is None:
+                    dropped += 1
+                    continue
+                x1, y1, x2, y2 = roi_box
+                if min(x2 - x1, y2 - y1) < DROP_MIN_SIDE:
+                    dropped += 1
+                    continue
+                valid_paths.append(path)
+                valid_labels.append(int(y))
+            except Exception:
+                dropped += 1
+        self.paths = np.asarray(valid_paths, dtype=object)
+        self.labels = np.asarray(valid_labels, dtype=np.int64)
 
         self.index_map = []
         for i, y in enumerate(self.labels):
@@ -244,7 +274,7 @@ class A4MixedViewDataset(Dataset):
         eff_n = len(self.index_map)
         a4_base = int((self.labels == A4_CLASS_IDX).sum())
         a4_eff = int((self.effective_labels == A4_CLASS_IDX).sum())
-        print(f"[{split.upper()}] base={base_n}, effective={eff_n}, A4 base={a4_base}, A4 effective={a4_eff}")
+        print(f"[{split.upper()}] base={base_n}, effective={eff_n}, A4 base={a4_base}, A4 effective={a4_eff}, dropped={dropped}")
 
     def __len__(self):
         return len(self.index_map)
@@ -258,13 +288,11 @@ class A4MixedViewDataset(Dataset):
             with Image.open(path) as img:
                 img = img.convert("RGB")
                 roi_box = extract_roi_box(find_json_for_image(Path(path)), img.width, img.height)
-                cropped = crop_view(img, roi_box, view_type, IMG_SIZE)
-                if cropped is None:
-                    img = Image.new("RGB", (IMG_SIZE, IMG_SIZE))
-                else:
-                    img = cropped
-        except Exception:
-            img = Image.new("RGB", (IMG_SIZE, IMG_SIZE))
+                img = crop_view(img, path, roi_box, view_type, IMG_SIZE)
+                if img is None:
+                    raise ValueError(f"invalid roi for {path}")
+        except Exception as e:
+            raise RuntimeError(f"Failed to load valid sample: {path}") from e
 
         if self.transform:
             img = self.transform(img)

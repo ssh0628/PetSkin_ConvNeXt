@@ -139,28 +139,18 @@ def crop_three_views(
     imgsz: int,
     drop_min_side: int,
     ext_ratio: float,
-    min_ext_crop: int,
     k_offset: float,
     offset_mode: str,
-    fallback: str,
 ):
     if roi_box is None:
-        if fallback == "full":
-            full = img.resize((imgsz, imgsz), resample=Image.BICUBIC)
-            return full, full, full
-        black = Image.new("RGB", (imgsz, imgsz))
-        return black, black, black
+        return None, None, None
 
     x1, y1, x2, y2 = roi_box
     w0 = x2 - x1
     h0 = y2 - y1
     min_side = min(w0, h0)
     if min_side < drop_min_side:
-        if fallback == "full":
-            full = img.resize((imgsz, imgsz), resample=Image.BICUBIC)
-            return full, full, full
-        black = Image.new("RGB", (imgsz, imgsz))
-        return black, black, black
+        return None, None, None
 
     cx = x1 + w0 / 2
     cy = y1 + h0 / 2
@@ -169,11 +159,8 @@ def crop_three_views(
     roi_crop = img.crop((x1, y1, x2, y2)).resize((imgsz, imgsz), resample=Image.BICUBIC)
 
     # View 2: Extended = bbox 중심 고정 + (w,h)만 ext_ratio 배 확장
-    w_ext = int(round(ext_ratio * w0))
-    h_ext = int(round(ext_ratio * h0))
-    if min_ext_crop > 0:
-        w_ext = max(w_ext, int(min_ext_crop))
-        h_ext = max(h_ext, int(min_ext_crop))
+    w_ext = max(1, int(round(ext_ratio * w0)))
+    h_ext = max(1, int(round(ext_ratio * h0)))
     ext_crop = rect_crop_clamp(img, cx, cy, w_ext, h_ext).resize((imgsz, imgsz), resample=Image.BICUBIC)
 
     # View 3: Offset = extended 크기 기준 deterministic 이동
@@ -199,32 +186,47 @@ class NPYPath3ViewDataset(Dataset):
         transform=None,
         imgsz: int = 224,
         drop_min_side: int = 20,
-        ext_ratio: float = 2.0,
-        min_ext_crop: int = 96,
+        ext_ratio: float = 1.2,
         k_offset: float = 0.1,
-        offset_mode: str = "fixed",
-        fallback: str = "black",
+        offset_mode: str = "hash",
     ):
         self.npy_dir = Path(npy_dir)
         self.transform = transform
         self.imgsz = int(imgsz)
         self.drop_min_side = int(drop_min_side)
         self.ext_ratio = float(ext_ratio)
-        self.min_ext_crop = int(min_ext_crop)
         self.k_offset = float(k_offset)
         self.offset_mode = offset_mode
-        self.fallback = fallback
-
         paths_file = self.npy_dir / f"{split}_paths.npy"
         labels_file = self.npy_dir / f"{split}_labels.npy"
         if not paths_file.exists() or not labels_file.exists():
             raise FileNotFoundError(f"Missing: {paths_file} or {labels_file}")
 
-        self.paths = np.load(paths_file, allow_pickle=False)
-        self.labels = np.load(labels_file, allow_pickle=False).astype(np.int64)
-
-        if len(self.paths) != len(self.labels):
-            raise ValueError(f"paths/labels length mismatch: {len(self.paths)} vs {len(self.labels)}")
+        raw_paths = np.load(paths_file, allow_pickle=False)
+        raw_labels = np.load(labels_file, allow_pickle=False).astype(np.int64)
+        valid_paths = []
+        valid_labels = []
+        dropped = 0
+        for p, y in zip(raw_paths, raw_labels):
+            path = p.item() if isinstance(p, np.generic) else str(p)
+            try:
+                with Image.open(path) as img:
+                    img = img.convert("RGB")
+                    roi_box = extract_roi_box(find_json_for_image(Path(path)), img.width, img.height)
+                if roi_box is None:
+                    dropped += 1
+                    continue
+                x1, y1, x2, y2 = roi_box
+                if min(x2 - x1, y2 - y1) < self.drop_min_side:
+                    dropped += 1
+                    continue
+                valid_paths.append(path)
+                valid_labels.append(int(y))
+            except Exception:
+                dropped += 1
+        self.paths = np.asarray(valid_paths, dtype=object)
+        self.labels = np.asarray(valid_labels, dtype=np.int64)
+        print(f"[{split.upper()}] valid={len(self.paths)} dropped={dropped}")
 
     def __len__(self):
         return len(self.paths)
@@ -245,15 +247,13 @@ class NPYPath3ViewDataset(Dataset):
                     imgsz=self.imgsz,
                     drop_min_side=self.drop_min_side,
                     ext_ratio=self.ext_ratio,
-                    min_ext_crop=self.min_ext_crop,
                     k_offset=self.k_offset,
                     offset_mode=self.offset_mode,
-                    fallback=self.fallback,
                 )
-        except Exception:
-            roi_img = Image.new("RGB", (self.imgsz, self.imgsz))
-            ext_img = roi_img
-            off_img = roi_img
+                if roi_img is None or ext_img is None or off_img is None:
+                    raise ValueError(f"invalid roi for {path}")
+        except Exception as e:
+            raise RuntimeError(f"Failed to load valid sample: {path}") from e
 
         if self.transform:
             roi_img = self.transform(roi_img)
@@ -318,11 +318,9 @@ def main():
     # extended view 배율: bbox (w,h)에 곱해 확장 (예: 2.0이면 가로/세로 2배)
     ap.add_argument("--ext_ratio", default=1.2, type=float)
     # extended crop 최소 크기(px): ROI가 작아도 ext가 너무 작아지지 않게 보정, 0이면 비활성화
-    ap.add_argument("--min_ext_crop", default=80, type=int)
     ap.add_argument("--k_offset", default=0.1, type=float)
     # offset 생성 방식: fixed(고정 이동) 또는 hash(샘플별 고정 pseudo-random)
     ap.add_argument("--offset_mode", default="hash", choices=["fixed", "hash"])
-    ap.add_argument("--fallback", default="black", choices=["black", "full"])
     args = ap.parse_args()
 
     ckpt = Path(args.ckpt)
@@ -377,10 +375,8 @@ def main():
         imgsz=args.imgsz,
         drop_min_side=args.drop_min_side,
         ext_ratio=args.ext_ratio,
-        min_ext_crop=args.min_ext_crop,
         k_offset=args.k_offset,
         offset_mode=args.offset_mode,
-        fallback=args.fallback,
     )
 
     loader = DataLoader(

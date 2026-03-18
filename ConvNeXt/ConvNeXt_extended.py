@@ -1,35 +1,79 @@
-# multi-roi_train/convnext_view_independent_CE.py
+# ConvNeXt_extended.py
 import os
-import sys
 import csv
 import json
-import hashlib
 import random
+from pathlib import Path
+
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, Dataset
-from torchvision import transforms
+from PIL import Image, ImageFile
 from timm import create_model
 from timm.data import resolve_data_config
-from PIL import Image, ImageFile
-from tqdm import tqdm
 from torch.optim.lr_scheduler import CosineAnnealingLR
-from pathlib import Path
+from torch.utils.data import DataLoader, Dataset
+from torchvision import transforms
+from tqdm import tqdm
 
-# -------------------------
-# ROI view config (constants)
-# -------------------------
+# =========================
+# 0. PIL / CUDA / AMP 설정
+# =========================
+ImageFile.LOAD_TRUNCATED_IMAGES = True
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+torch.backends.cudnn.benchmark = True
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Device:", device)
+
+amp_device = "cuda" if device.type == "cuda" else "cpu"
+amp_dtype = torch.float16
+if device.type == "cuda" and torch.cuda.is_bf16_supported():
+    amp_dtype = torch.bfloat16
+print(f"AMP Config: device={amp_device}, dtype={amp_dtype}")
+
+# =========================
+# 1. 설정
+# =========================
+NPY_DIR = "/root/project/dataset/cache_npy_sqrt"
+SAVE_DIR = "/root/project/Result/single_roi_trained/extended_WCE"
+os.makedirs(SAVE_DIR, exist_ok=True)
+LOG_PATH = os.path.join(SAVE_DIR, "train_log.csv")
+
+NUM_CLASSES = 8
+BATCH_SIZE = 256
+NUM_EPOCHS = 200
+IMG_SIZE = 224
+RANDOM_SEED = 1
+PATIENCE = 20
+Freeze = 5
+NUM_WORKERS = 8
+PREFETCH_FACTOR = 2
+PERSISTENT_WORKERS = True
+USE_CHANNELS_LAST = True
+USE_COMPILE = False
+
 DROP_MIN_SIDE = 20
-N_SCALE = 1.2
-K_OFFSET = 0.1
-USE_OFF_VIEW = True
-NUM_VIEWS = 3  # roi, extended, offset (when USE_OFF_VIEW)
+EXT_RATIO = 1.2
 
-# -------------------------
-# ROI helpers (JSON -> bbox)
-# -------------------------
+random.seed(RANDOM_SEED)
+np.random.seed(RANDOM_SEED)
+torch.manual_seed(RANDOM_SEED)
+torch.cuda.manual_seed_all(RANDOM_SEED)
+
+WEIGHT_DECAY = 0.1
+LR1 = 1e-3
+LR2 = 3e-5
+
+pretrained = True
+model_name = "convnextv2_tiny.fcmae_ft_in22k_in1k"
+drop_path_rate = 0.2
+
+print(f"[Info] Reading Data from: {NPY_DIR}")
+
+
 def find_json_for_image(img_path: Path) -> Path | None:
     c1 = img_path.with_suffix(".json")
     if c1.exists():
@@ -51,35 +95,37 @@ def extract_roi_box(json_path: Path, img_w: int, img_h: int):
             data = json.load(f)
         if "labelingInfo" in data:
             for info_item in data["labelingInfo"]:
-                if "box" in info_item:
-                    box_info = info_item["box"]
-                    if "location" in box_info and len(box_info["location"]) > 0:
-                        loc = box_info["location"][0]
-                        x = int(loc.get("x"))
-                        y = int(loc.get("y"))
-                        w = int(loc.get("width"))
-                        h = int(loc.get("height"))
-                        if w > 0 and h > 0:
-                            x1, y1 = x, y
-                            x2, y2 = x + w, y + h
-                            x1 = max(0, x1)
-                            y1 = max(0, y1)
-                            x2 = min(img_w, x2)
-                            y2 = min(img_h, y2)
-                            if x2 > x1 and y2 > y1:
-                                return (x1, y1, x2, y2)
+                box = info_item.get("box")
+                if not box:
+                    continue
+                locs = box.get("location") or []
+                if not locs:
+                    continue
+                loc = locs[0]
+                x = int(loc.get("x"))
+                y = int(loc.get("y"))
+                w = int(loc.get("width"))
+                h = int(loc.get("height"))
+                if w > 0 and h > 0:
+                    x1, y1 = max(0, x), max(0, y)
+                    x2, y2 = min(img_w, x + w), min(img_h, y + h)
+                    if x2 > x1 and y2 > y1:
+                        return (x1, y1, x2, y2)
     except Exception:
         return None
     return None
 
 
-def square_crop_clamp(img: Image.Image, cx: float, cy: float, window_size: int):
+def rect_crop_clamp(img: Image.Image, cx: float, cy: float, crop_w: int, crop_h: int):
     img_w, img_h = img.size
-    half = window_size / 2
-    x1 = int(round(cx - half))
-    y1 = int(round(cy - half))
-    x2 = x1 + window_size
-    y2 = y1 + window_size
+    crop_w = max(1, int(crop_w))
+    crop_h = max(1, int(crop_h))
+    half_w = crop_w / 2
+    half_h = crop_h / 2
+    x1 = int(round(cx - half_w))
+    y1 = int(round(cy - half_h))
+    x2 = x1 + crop_w
+    y2 = y1 + crop_h
 
     if x1 < 0:
         shift = -x1
@@ -105,181 +151,17 @@ def square_crop_clamp(img: Image.Image, cx: float, cy: float, window_size: int):
     return img.crop((x1, y1, x2, y2))
 
 
-def clamp_center_for_bbox(off_c: float, box_lo: int, box_hi: int, crop_size: int, img_size: int):
-    half = crop_size / 2.0
-    lo_img = half
-    hi_img = img_size - half
-    lo_box = box_hi - half
-    hi_box = box_lo + half
-    lo = max(lo_img, lo_box)
-    hi = min(hi_img, hi_box)
-    if lo <= hi:
-        return max(lo, min(off_c, hi))
-    if lo_img <= hi_img:
-        return max(lo_img, min(off_c, hi_img))
-    return off_c
-
-
-def deterministic_hash_offset(path: str, base_size: float, k_offset: float):
-    digest = hashlib.md5(path.encode("utf-8")).digest()
-    a = int.from_bytes(digest[:8], "big")
-    b = int.from_bytes(digest[8:], "big")
-    rx = (a / ((1 << 64) - 1)) * 2.0 - 1.0
-    ry = (b / ((1 << 64) - 1)) * 2.0 - 1.0
-    return rx * k_offset * base_size, ry * k_offset * base_size
-
-
-def crop_view(img: Image.Image, path: str, roi_box, view_type: int, img_size: int):
-    img_w, img_h = img.size
-    if roi_box is None:
-        return None
-
-    x1, y1, x2, y2 = roi_box
-    w0 = x2 - x1
-    h0 = y2 - y1
-    min_side = min(w0, h0)
-    if min_side < DROP_MIN_SIDE:
-        return None
-
-    cx = x1 + w0 / 2
-    cy = y1 + h0 / 2
-
-    if view_type == 0:
-        crop = img.crop((x1, y1, x2, y2))
-        return crop.resize((img_size, img_size), resample=Image.BICUBIC)
-
-    # extended / offset: scale-based square window
-    scale = max(1, int(round(N_SCALE * max(w0, h0))))
-    if view_type == 2:
-        dx, dy = deterministic_hash_offset(path, scale, K_OFFSET)
-        cx = clamp_center_for_bbox(cx + dx, x1, x2, scale, img_w)
-        cy = clamp_center_for_bbox(cy + dy, y1, y2, scale, img_h)
-
-    crop = square_crop_clamp(img, cx, cy, scale)
-    return crop.resize((img_size, img_size), resample=Image.BICUBIC)
-# =========================
-# 0. PIL / CUDA / AMP 설정
-# =========================
-ImageFile.LOAD_TRUNCATED_IMAGES = True
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.allow_tf32 = True
-torch.backends.cudnn.benchmark = True
-
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print("Device:", device)
-
-# Safe AMP setup
-amp_device = "cuda" if device.type == "cuda" else "cpu"
-amp_dtype = torch.float16 # Default safe choice
-if device.type == "cuda" and torch.cuda.is_bf16_supported():
-    amp_dtype = torch.bfloat16
-
-print(f"AMP Config: device={amp_device}, dtype={amp_dtype}")
-
-# =========================
-# 1. 설정
-# =========================
-NPY_DIR = "/root/project/dataset/cache_npy_sqrt"
-SAVE_DIR = "/root/project/Result/multi_roi_trained/3view(independent)+CE_ver3"
-os.makedirs(SAVE_DIR, exist_ok=True)
-LOG_PATH = os.path.join(SAVE_DIR, "train_log.csv")
-
-NUM_CLASSES = 8
-BATCH_SIZE = 256
-NUM_EPOCHS = 200
-IMG_SIZE = 224
-RANDOM_SEED = 0
-PATIENCE = 20
-Freeze = 5
-NUM_WORKERS = 8
-PREFETCH_FACTOR = 2
-PERSISTENT_WORKERS = True
-USE_CHANNELS_LAST = True
-USE_COMPILE = False
-LOSS_MODE = "CE"  # "CE" or "WCE"
-WCE_MODE = "inv_sqrt"  # "inv" or "inv_sqrt"
-WCE_NORMALIZE = True
-
-import random
-random.seed(RANDOM_SEED)
-np.random.seed(RANDOM_SEED)
-torch.manual_seed(RANDOM_SEED)
-torch.cuda.manual_seed_all(RANDOM_SEED)
-
-WEIGHT_DECAY = 0.1
-LR1 = 1e-3
-LR2 = 3e-5
-
-pretrained = True
-model_name = "convnextv2_tiny.fcmae_ft_in22k_in1k"
-# model_name = "convnextv2_femto.fcmae_ft_in1k"
-drop_path_rate = 0.2
-
-print(f"[Info] Reading Data from: {NPY_DIR}")
-
-def compute_wce_weights(labels: np.ndarray, num_classes: int):
-    counts = np.bincount(labels, minlength=num_classes).astype(np.float64)
-    counts[counts == 0] = 1.0
-    if WCE_MODE == "inv":
-        weights = 1.0 / counts
-    else:
-        weights = 1.0 / np.sqrt(counts)
-    if WCE_NORMALIZE:
-        weights = weights / weights.mean()
+def build_class_weights(labels, num_classes):
+    counts = np.bincount(np.asarray(labels, dtype=np.int64), minlength=num_classes).astype(np.float32)
+    counts[counts <= 0] = 1.0
+    weights = 1.0 / np.sqrt(counts)
+    weights = weights / weights.mean()
     return torch.tensor(weights, dtype=torch.float32)
 
-# -------------------------
-# ROI (JSON -> bbox)
-# -------------------------
-def find_json_for_image(img_path: Path) -> Path | None:
-    c1 = img_path.with_suffix(".json")
-    if c1.exists():
-        return c1
-    c2 = img_path.with_suffix(".JSON")
-    if c2.exists():
-        return c2
-    c3 = img_path.with_name(img_path.name + ".json")
-    if c3.exists():
-        return c3
-    return None
 
-
-def extract_roi_box(json_path: Path, img_w: int, img_h: int):
-    if not json_path or not json_path.exists():
-        return None
-    try:
-        with open(json_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if "labelingInfo" in data:
-            for info_item in data["labelingInfo"]:
-                if "box" in info_item:
-                    box_info = info_item["box"]
-                    if "location" in box_info and len(box_info["location"]) > 0:
-                        loc = box_info["location"][0]
-                        x = int(loc.get("x"))
-                        y = int(loc.get("y"))
-                        w = int(loc.get("width"))
-                        h = int(loc.get("height"))
-                        if w > 0 and h > 0:
-                            x1, y1 = x, y
-                            x2, y2 = x + w, y + h
-                            # clamp to image bounds
-                            x1 = max(0, x1)
-                            y1 = max(0, y1)
-                            x2 = min(img_w, x2)
-                            y2 = min(img_h, y2)
-                            if x2 > x1 and y2 > y1:
-                                return (x1, y1, x2, y2)
-    except Exception:
-        return None
-    return None
-    
-# =========================
-# 1.1 Class Check
-# =========================
 cls_json_path = os.path.join(NPY_DIR, "classes.json")
 if os.path.exists(cls_json_path):
-    with open(cls_json_path, 'r') as f:
+    with open(cls_json_path, "r") as f:
         meta = json.load(f)
         classes = meta.get("classes", [])
         if len(classes) != NUM_CLASSES:
@@ -292,22 +174,18 @@ else:
     print(f"[WARN] classes.json not found in {NPY_DIR}. Assuming NUM_CLASSES={NUM_CLASSES}")
 
 
-# =========================
-# 2. Dataset Definition (NPY)
-# =========================
 class NPYPathDataset(Dataset):
     def __init__(self, npy_dir, split, transform=None):
         super().__init__()
         self.transform = transform
         self.npy_dir = Path(npy_dir)
         self.split = split
-        
+
         paths_file = self.npy_dir / f"{split}_paths.npy"
         labels_file = self.npy_dir / f"{split}_labels.npy"
-        
         if not paths_file.exists() or not labels_file.exists():
             raise RuntimeError(f"[ERR] Missing NPY files for split '{split}' in {npy_dir}")
-            
+
         raw_paths = np.load(paths_file, allow_pickle=True)
         raw_labels = np.load(labels_file, allow_pickle=True).astype(np.int64)
         valid_paths = []
@@ -335,39 +213,40 @@ class NPYPathDataset(Dataset):
         print(f"[{split.upper()}] Loaded {len(self.paths)} valid samples. dropped={dropped}")
 
     def __len__(self):
-        return len(self.paths) * (3 if USE_OFF_VIEW else 2)
+        return len(self.paths)
 
     def __getitem__(self, idx):
-        views_per_sample = 3 if USE_OFF_VIEW else 2
-        base_idx = idx // views_per_sample
-        view_type = idx % views_per_sample
-        path = str(self.paths[base_idx])
-        label = int(self.labels[base_idx])
-        
+        path = str(self.paths[idx])
+        label = int(self.labels[idx])
         try:
             with Image.open(path) as img:
                 img = img.convert("RGB")
                 roi_box = extract_roi_box(find_json_for_image(Path(path)), img.width, img.height)
-                img = crop_view(img, path, roi_box, view_type, IMG_SIZE)
-                if img is None:
-                    raise ValueError(f"invalid roi for {path}")
+                if roi_box is None:
+                    raise ValueError(f"missing roi_box for {path}")
+                x1, y1, x2, y2 = roi_box
+                w0 = x2 - x1
+                h0 = y2 - y1
+                if min(w0, h0) < DROP_MIN_SIDE:
+                    raise ValueError(f"small roi for {path}")
+                cx = x1 + w0 / 2
+                cy = y1 + h0 / 2
+                w_ext = max(1, int(round(EXT_RATIO * w0)))
+                h_ext = max(1, int(round(EXT_RATIO * h0)))
+                img = rect_crop_clamp(img, cx, cy, w_ext, h_ext)
         except Exception as e:
             raise RuntimeError(f"Failed to load valid sample: {path}") from e
 
         if self.transform:
             img = self.transform(img)
-
         return img, label, idx
 
 
-# =========================
-# 3. Model
-# =========================
 model = create_model(
     model_name,
     pretrained=pretrained,
     num_classes=NUM_CLASSES,
-    drop_path_rate=drop_path_rate
+    drop_path_rate=drop_path_rate,
 )
 if USE_CHANNELS_LAST:
     model = model.to(device, memory_format=torch.channels_last)
@@ -377,27 +256,12 @@ else:
 if USE_COMPILE and device.type == "cuda":
     model = torch.compile(model)
 
-# Backbone freeze (Init)
 for name, param in model.named_parameters():
     if "head" not in name:
         param.requires_grad = False
 
 data_config = resolve_data_config({}, model=model)
 
-# =========================
-# 4. Transform
-# =========================
-"""
-train_transform = transforms.Compose([
-    transforms.Resize((IMG_SIZE, IMG_SIZE)),
-    transforms.RandomHorizontalFlip(),
-    transforms.RandomVerticalFlip(),
-    transforms.RandomRotation(90),
-    transforms.ColorJitter(0.2, 0.75, 0.25, 0.04),
-    transforms.ToTensor(),
-    transforms.Normalize(data_config['mean'], data_config['std']),
-])
-"""
 train_transform = transforms.Compose([
     transforms.Resize((IMG_SIZE, IMG_SIZE)),
     transforms.RandomHorizontalFlip(p=0.5),
@@ -405,22 +269,14 @@ train_transform = transforms.Compose([
     transforms.RandomRotation(15),
     transforms.ColorJitter(0.1, 0.1, 0.05, 0.02),
     transforms.ToTensor(),
-    transforms.Normalize(data_config['mean'], data_config['std']),
+    transforms.Normalize(data_config["mean"], data_config["std"]),
 ])
 
 eval_transform = transforms.Compose([
     transforms.Resize((IMG_SIZE, IMG_SIZE)),
     transforms.ToTensor(),
-    transforms.Normalize(data_config['mean'], data_config['std']),
+    transforms.Normalize(data_config["mean"], data_config["std"]),
 ])
-
-# =========================
-# 5. Dataset & DataLoader
-# =========================
-seed_everything = True
-if seed_everything:
-    # Basic seed setting if needed, though DataLoader handles shuffle
-    torch.manual_seed(RANDOM_SEED)
 
 train_dataset = NPYPathDataset(NPY_DIR, "train", transform=train_transform)
 val_dataset = NPYPathDataset(NPY_DIR, "val", transform=eval_transform)
@@ -454,31 +310,12 @@ test_loader = DataLoader(
     persistent_workers=PERSISTENT_WORKERS,
 )
 
-# =========================
-# 6. Optimizer / Scheduler
-# =========================
-if LOSS_MODE == "WCE":
-    train_labels_path = Path(NPY_DIR) / "train_labels.npy"
-    if train_labels_path.exists():
-        train_labels = np.load(train_labels_path, allow_pickle=True).astype(np.int64)
-        wce_weights = compute_wce_weights(train_labels, NUM_CLASSES)
-        print(f"[Info] WCE enabled ({WCE_MODE}).")
-    else:
-        print(f"[WARN] train_labels.npy not found for WCE: {train_labels_path}")
-        wce_weights = None
-    criterion = nn.CrossEntropyLoss(weight=wce_weights.to(device) if wce_weights is not None else None)
-else:
-    criterion = nn.CrossEntropyLoss()
-optimizer = optim.AdamW(
-    filter(lambda p: p.requires_grad, model.parameters()),
-    lr=LR1,
-    weight_decay=WEIGHT_DECAY
-)
+class_weights = build_class_weights(train_dataset.labels, NUM_CLASSES).to(device)
+print(f"[INFO] WCE class_weights={class_weights.detach().cpu().tolist()}")
+criterion = nn.CrossEntropyLoss(weight=class_weights)
+optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=LR1, weight_decay=WEIGHT_DECAY)
 scheduler = CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS, eta_min=1e-6)
 
-# =========================
-# 7. Train Loop
-# =========================
 with open(LOG_PATH, "w", newline="") as f:
     writer = csv.writer(f)
     writer.writerow(["epoch", "lr", "train_loss", "train_acc", "val_loss", "val_acc"])
@@ -487,20 +324,17 @@ best_val = 0.0
 patience_counter = 0
 
 for epoch in range(NUM_EPOCHS):
-    print(f"\n===== Epoch {epoch+1}/{NUM_EPOCHS} =====")
+    print(f"\n===== Epoch {epoch + 1}/{NUM_EPOCHS} =====")
 
-    # Backbone unfreeze logic
     if epoch == Freeze:
         print(">>> Unfreezing backbone")
         for p in model.parameters():
             p.requires_grad = True
         optimizer = optim.AdamW(model.parameters(), lr=LR2, weight_decay=WEIGHT_DECAY)
-        scheduler = CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS-epoch, eta_min=1e-6)
+        scheduler = CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS - epoch, eta_min=1e-6)
 
-    # ---- Train ----
     model.train()
     total, correct, loss_sum = 0, 0, 0.0
-
     for x, y, idx in tqdm(train_loader, desc="Train"):
         if USE_CHANNELS_LAST:
             x = x.to(device, non_blocking=True, memory_format=torch.channels_last)
@@ -523,14 +357,11 @@ for epoch in range(NUM_EPOCHS):
 
     train_loss = loss_sum / total
     train_acc = correct / total
-
     scheduler.step()
 
-    # ---- Validation ----
     model.eval()
     correct, total = 0, 0
     val_loss_sum = 0.0
-
     with torch.no_grad():
         for x, y, idx in tqdm(val_loader, desc="Val"):
             if USE_CHANNELS_LAST:
@@ -551,11 +382,10 @@ for epoch in range(NUM_EPOCHS):
     val_acc = correct / total
     val_loss = val_loss_sum / total
     lr = optimizer.param_groups[0]["lr"]
-
     print(f"TrainLoss={train_loss:.4f} TrainAcc={train_acc:.4f} ValLoss={val_loss:.4f} ValAcc={val_acc:.4f} LR={lr:.2e}")
 
     with open(LOG_PATH, "a", newline="") as f:
-        csv.writer(f).writerow([epoch+1, lr, train_loss, train_acc, val_loss, val_acc])
+        csv.writer(f).writerow([epoch + 1, lr, train_loss, train_acc, val_loss, val_acc])
 
     if val_acc > best_val:
         best_val = val_acc
@@ -565,12 +395,9 @@ for epoch in range(NUM_EPOCHS):
     else:
         patience_counter += 1
         if patience_counter >= PATIENCE:
-            print(f"Early Stopping triggered at Epoch {epoch+1}")
+            print(f"Early Stopping triggered at Epoch {epoch + 1}")
             break
 
-# =========================
-# 8. Test
-# =========================
 print(f"\n[Test] Loading best model from {SAVE_DIR}/best_model.pth")
 model.load_state_dict(torch.load(os.path.join(SAVE_DIR, "best_model.pth"), map_location="cpu"))
 model.to(device)
